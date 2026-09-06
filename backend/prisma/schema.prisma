@@ -1,0 +1,95 @@
+// Prisma schema — PostgreSQL is the source of truth for all email state.
+// BullMQ/Redis only holds the *execution* of a job; this DB is what the
+// dashboard reads from and what a recovered server re-syncs against.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(uuid())
+  googleId  String   @unique
+  email     String   @unique
+  name      String
+  avatarUrl String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  slackIntegration SlackIntegration?
+  batches          EmailBatch[]
+  emails           ScheduledEmail[]
+}
+
+model SlackIntegration {
+  id          String   @id @default(uuid())
+  userId      String   @unique
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  teamId      String
+  teamName    String
+  accessToken String // bot/user OAuth token returned by Slack (encrypt at rest in real production use)
+  webhookUrl  String? // incoming webhook URL, used for the simplest "post to channel" path
+  channelId   String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+enum EmailStatus {
+  pending
+  processing
+  sent
+  failed
+}
+
+// One "Compose" submission from the UI. Groups N recipient emails together
+// so the dashboard can show batch-level context even though every recipient
+// gets its own row (and its own BullMQ job) in ScheduledEmail.
+model EmailBatch {
+  id              String   @id @default(uuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  senderId        String // multi-tenant rate-limit identity, defaults to userId
+  subject         String
+  body            String   @db.Text
+  startTime       DateTime
+  delaySeconds    Int
+  hourlyLimit     Int
+  totalRecipients Int
+  createdAt       DateTime @default(now())
+
+  emails ScheduledEmail[]
+
+  @@index([userId])
+}
+
+model ScheduledEmail {
+  id             String      @id @default(uuid())
+  batchId        String
+  batch          EmailBatch  @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  senderId       String
+  recipientEmail String
+  subject        String
+  body           String      @db.Text
+  // Sequence preserves the original CSV order. When a job is bumped to the
+  // next hourly window because a rate limit was hit, ties on the new
+  // timestamp are broken using this field so relative order never changes.
+  sequence       Int
+  scheduledFor   DateTime
+  sentAt         DateTime?
+  status         EmailStatus @default(pending)
+  attempts       Int         @default(0)
+  bullJobId      String?
+  errorMessage   String?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  @@index([status])
+  @@index([senderId, scheduledFor])
+  @@index([batchId, sequence])
+}
